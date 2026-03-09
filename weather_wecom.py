@@ -1,162 +1,165 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-weather_wecom.py
-企业微信天气推送脚本（使用 Open-Meteo 免费 API）
-配置来源（环境变量或 GitHub Secrets）:
-  WECOM_CORP_ID       - 企业微信 corp id
-  WECOM_CORP_SECRET   - 企业微信 corp secret
-  WECOM_AGENT_ID      - 企业微信应用 agentid (整数)
-  WECOM_TO_USER       - 接收者，用户名列表或 @all (可选，默认 "@all")
-  CITY                - 城市名 (例如 "Xuancheng, China")
-  PREVIEW_DAYS        - 预览天数 (3..7)，默认 5
-  FORECAST_DAYS       - 请求的 forecast 天数 (>= PREVIEW_DAYS)，默认 5
-可选调整:
-  SEVERE_RAIN_MM      - 触发“暴雨”提醒的日降水量阈值 (默认 20 mm)
-  SEVERE_WIND_MS      - 触发“大风”提醒的最大阵风阈值 (m/s, 默认 15 m/s)
-  MODE                - "auto"|"morning"|"evening"（决定重点日期）
+weather_wecom.py (使用 yiketianqi 接口)
+说明:
+- 优先使用 YIKE_API_URL_TEMPLATE（如果设置），模板中可包含 {city} {appid} {appsecret}
+- 否则使用默认模板并填充 YIKE_APPID / YIKE_APPSECRET 与 CITY
+配置 (环境变量 / GitHub Secrets):
+- WECOM_CORP_ID, WECOM_CORP_SECRET, WECOM_AGENT_ID, WECOM_TO_USER
+- CITY (例如 "Xuancheng, China" 或 "宣城")
+- YIKE_APPID, YIKE_APPSECRET  (你的易可天气/appid & appsecret)
+- 可选: YIKE_API_URL_TEMPLATE (例如 "https://yiketianqi.com/api?version=v1&city={city}&appid={appid}&appsecret={appsecret}")
+- 其它可选: PREVIEW_DAYS, FORECAST_DAYS, SEVERE_RAIN_MM, SEVERE_WIND_MS, MODE
 """
 import os
 import sys
 import requests
 from datetime import datetime, timedelta
 
-GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
-FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+# 企业微信 API
 WECOM_TOKEN_URL = "https://qyapi.weixin.qq.com/cgi-bin/gettoken"
 WECOM_SEND_URL = "https://qyapi.weixin.qq.com/cgi-bin/message/send"
 
-# --- helpers ---
-def geocode_city(city):
-    params = {"name": city, "count": 1, "language": "zh"}
-    r = requests.get(GEOCODE_URL, params=params, timeout=10)
+# 默认 yiketianqi API URL 模板（仅作示例）
+DEFAULT_YIKE_TEMPLATE = "https://yiketianqi.com/api?version=v1&city={city}&appid={appid}&appsecret={appsecret}"
+
+# 关键字用于检测恶劣天气（中文）
+SEVERE_KEYWORDS = ["暴雨", "大雨", "雷", "雷暴", "冰雹", "雪", "大风", "台风", "强风", "风暴", "冻雨"]
+
+# ---------- helpers ----------
+def safe_getenv(key, default=None):
+    v = os.getenv(key)
+    if v is None:
+        return default
+    s = str(v).strip()
+    return s if s != "" else default
+
+def getenv_int(key, default):
+    v = safe_getenv(key, None)
+    if v is None:
+        return int(default)
+    try:
+        return int(v)
+    except Exception:
+        return int(default)
+
+def getenv_float(key, default):
+    v = safe_getenv(key, None)
+    if v is None:
+        return float(default)
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
+
+# ---------- yiketianqi interaction ----------
+def build_yike_url(city, appid=None, appsecret=None):
+    # 优先使用完整模板（允许自定义）
+    template = safe_getenv("YIKE_API_URL_TEMPLATE", None)
+    if template:
+        try:
+            return template.format(city=city, appid=appid or "", appsecret=appsecret or "")
+        except Exception:
+            # fallback to default template below
+            pass
+    # 使用默认模板（若 appid/appsecret 未提供，仍会拼接，但请求可能失败或 API 可能不需要这两个参数）
+    return DEFAULT_YIKE_TEMPLATE.format(city=city, appid=appid or "", appsecret=appsecret or "")
+
+def fetch_yike_weather(city, appid=None, appsecret=None, timeout=15):
+    url = build_yike_url(city, appid=appid, appsecret=appsecret)
+    r = requests.get(url, timeout=timeout)
     r.raise_for_status()
-    data = r.json()
-    results = data.get("results")
-    if not results:
-        raise RuntimeError(f"未找到城市: {city}")
-    top = results[0]
-    return {
-        "name": top.get("name"),
-        "country": top.get("country"),
-        "latitude": float(top.get("latitude")),
-        "longitude": float(top.get("longitude")),
-        "timezone": top.get("timezone")
+    # yiketianqi 返回可能是 JSON 或文本，尝试解析 JSON
+    try:
+        data = r.json()
+    except Exception:
+        # 若返回是字符串（例如 JSONP 或 plain text），尝试直接 interpret
+        text = r.text
+        # 尝试找到 JSON 开始处
+        import json
+        try:
+            first = text.index("{")
+            data = json.loads(text[first:])
+        except Exception:
+            # 无法解析，抛出
+            raise RuntimeError("无法解析 yiketianqi 返回结果： " + text[:200])
+    return data
+
+# 解析 yiketianqi ��见返回结构（尽量兼容）
+def parse_yike_response(data):
+    """
+    目标输出结构：
+    {
+      "city": "Xuancheng",
+      "current": { "date": "2026-03-09", "wea": "...", "tem": "...", ... },
+      "forecast": [ { "date": "...", "wea": "...", "tem1": "...", "tem2": "...", ... }, ... ]
     }
+    支持 yiketianqi 常见字段：data (list)、wea/tem/tem1/tem2/date/win/alarm
+    """
+    out = {"city": None, "current": None, "forecast": []}
 
-def fetch_forecast(lat, lon, timezone="auto", days=5):
-    daily = [
-        "temperature_2m_max",
-        "temperature_2m_min",
-        "precipitation_sum",
-        "weathercode"
-    ]
-    hourly = [
-        "windgusts_10m",
-        "precipitation_probability",
-        "time"
-    ]
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "daily": ",".join(daily),
-        "hourly": ",".join(hourly),
-        "current_weather": "true",
-        "timezone": timezone,
-        "forecast_days": days
-    }
-    r = requests.get(FORECAST_URL, params=params, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    # many yiketianqi responses wrap content under 'data' (list)
+    if isinstance(data, dict):
+        if "city" in data and out["city"] is None:
+            out["city"] = data.get("city")
+        # if there's a top-level 'data' that's a list of days
+        arr = data.get("data") or data.get("forecast") or data.get("daily") or None
+        if isinstance(arr, list) and len(arr) > 0:
+            # often arr[0] is today's weather (or current), arr[1:] are forecasts
+            # find first element with a date
+            for i, item in enumerate(arr):
+                if not isinstance(item, dict):
+                    continue
+                # normalize fields
+                date = item.get("date") or item.get("day") or item.get("week") or None
+                wea = item.get("wea") or item.get("weather") or item.get("desc") or ""
+                # temps: some versions use tem / tem1/tem2
+                tem = item.get("tem") or item.get("temp") or item.get("temperature")
+                tem1 = item.get("tem1") or item.get("temp_max") or None
+                tem2 = item.get("tem2") or item.get("temp_min") or None
+                win = item.get("win") or item.get("wind") or ""
+                win_speed = item.get("win_speed") or item.get("wind_speed") or item.get("win_meter") or ""
+                alarm = item.get("alarm") or data.get("alarm") or None
 
-WEATHER_CODE_MAP = {
-    0: "晴", 1: "主要晴/少云", 2: "多云", 3: "阴",
-    45: "雾/薄雾", 48: "冰���雾",
-    51: "毛毛雨/细雨", 53: "中等毛毛雨", 55: "浓毛毛雨",
-    56: "冻毛毛雨", 57: "强冻毛毛雨",
-    61: "小雨", 63: "中雨", 65: "大雨", 66: "冻小雨", 67: "冻大雨",
-    71: "小雪", 73: "中雪", 75: "大雪", 77: "降雪颗粒",
-    80: "阵��", 81: "强阵雨", 82: "暴雨性阵雨",
-    85: "小雨夹雪", 86: "大雨夹雪",
-    95: "雷暴", 96: "伴有小冰雹的雷暴", 99: "伴有大冰雹的雷暴",
-}
+                parsed = {
+                    "date": date,
+                    "wea": wea,
+                    "tem": tem,
+                    "tem1": tem1,
+                    "tem2": tem2,
+                    "win": win,
+                    "win_speed": win_speed,
+                    "alarm": alarm
+                }
+                # first item we treat as current if no current exists
+                if i == 0:
+                    out["current"] = parsed
+                out["forecast"].append(parsed)
+            # set city if available
+            if out["city"] is None:
+                out["city"] = data.get("city") or (out["forecast"][0].get("city") if out["forecast"] else None)
+            return out
 
-def weather_code_desc(code):
-    return WEATHER_CODE_MAP.get(code, f"天气代码 {code}")
+        # fallback: direct fields
+        # sometimes response contains fields like 'wea', 'tem'
+        if "wea" in data or "tem" in data:
+            out["current"] = {
+                "date": data.get("date"),
+                "wea": data.get("wea"),
+                "tem": data.get("tem"),
+                "tem1": data.get("tem1"),
+                "tem2": data.get("tem2"),
+                "win": data.get("win"),
+                "win_speed": data.get("win_speed"),
+                "alarm": data.get("alarm")
+            }
+            return out
 
-def analyze_severe(forecast_json, severe_rain_mm=20.0, severe_wind_ms=15.0):
-    alerts = {}
-    daily = forecast_json.get("daily", {})
-    hourly = forecast_json.get("hourly", {})
-    dates = daily.get("time", [])
-    precip = daily.get("precipitation_sum", [])
-    codes = daily.get("weathercode", [])
-    hourly_times = hourly.get("time", [])
-    windgusts = hourly.get("windgusts_10m", [])
-    max_gust_by_date = {}
-    for t, gust in zip(hourly_times, windgusts):
-        d = t[:10]
-        try:
-            g = float(gust)
-        except Exception:
-            continue
-        max_gust_by_date[d] = max(max_gust_by_date.get(d, 0.0), g)
-    for i, d in enumerate(dates):
-        day_alerts = []
-        try:
-            code = int(codes[i])
-        except Exception:
-            code = None
-        try:
-            p = float(precip[i])
-        except Exception:
-            p = 0.0
-        if code is not None and code >= 95:
-            day_alerts.append("可能有雷暴/强对流（注意避雷、防大风）")
-        if p >= severe_rain_mm:
-            day_alerts.append(f"降水较大 (日降水量 {p} mm)，注意出行与排水")
-        max_gust = max_gust_by_date.get(d, 0.0)
-        if max_gust >= severe_wind_ms:
-            day_alerts.append(f"阵风较大 (最大阵风 {max_gust} m/s)，注意高空物体、出行安全")
-        if day_alerts:
-            alerts[d] = day_alerts
-    return alerts
+    # if reach here, unknown format
+    raise RuntimeError("无法识别 yiketianqi 返回的数据结构")
 
-def format_markdown(city_label, forecast_json, preview_days=5, target_date=None, severe_alerts=None):
-    daily = forecast_json.get("daily", {})
-    dates = daily.get("time", [])
-    tmax = daily.get("temperature_2m_max", [])
-    tmin = daily.get("temperature_2m_min", [])
-    precip = daily.get("precipitation_sum", [])
-    codes = daily.get("weathercode", [])
-    if target_date is None:
-        target_date = datetime.utcnow().strftime("%Y-%m-%d")
-    if target_date in dates:
-        idx = dates.index(target_date)
-    else:
-        idx = 0
-        target_date = dates[0] if dates else target_date
-    lines = []
-    title = f"天气预报 — {city_label} — {target_date}"
-    lines.append(f"### {title}")
-    lines.append("")
-    lines.append(f"**{target_date} 预报**")
-    lines.append(f"- 天气：{weather_code_desc(int(codes[idx])) if codes and len(codes)>idx else '无'}")
-    lines.append(f"- 气温：{tmin[idx]}°C ~ {tmax[idx]}°C")
-    lines.append(f"- 预计降水：{precip[idx]} mm")
-    if severe_alerts and target_date in severe_alerts:
-        for a in severe_alerts[target_date]:
-            lines.append(f"> 🛑 **预警**：{a}")
-    lines.append("")
-    lines.append(f"**未来 {preview_days} 天预览**")
-    for j in range(idx, min(idx + preview_days, len(dates))):
-        d = dates[j]
-        lines.append(f"- {d}：{weather_code_desc(int(codes[j])) if codes and len(codes)>j else '无'}，{tmin[j]}°C~{tmax[j]}°C，降水 {precip[j]} mm")
-    lines.append("")
-    lines.append("_数据来源：Open-Meteo（免费）_")
-    return "\n".join(lines), title
-
-# --- 企业微信交互 ---
+# ---------- 企业微信交互 ----------
 def wecom_get_access_token(corpid, corpsecret):
     params = {"corpid": corpid, "corpsecret": corpsecret}
     r = requests.get(WECOM_TOKEN_URL, params=params, timeout=10)
@@ -186,89 +189,143 @@ def wecom_send_markdown(access_token, agentid, touser, title, markdown):
         raise RuntimeError(f"企业微信发送失败: {data}")
     return data
 
-# --- safe env parsing helpers ---
-def getenv_int(key, default):
-    v = os.getenv(key)
-    if v is None or str(v).strip() == "":
-        return int(default)
-    try:
-        return int(v)
-    except Exception:
-        return int(default)
+# ---------- formatting & analysis ----------
+def detect_severe_from_text(text):
+    if not text:
+        return []
+    alerts = []
+    for kw in SEVERE_KEYWORDS:
+        if kw in text:
+            alerts.append(f"检测到关键字“{kw}”——可能出现恶劣天气，请注意防护")
+    return alerts
 
-def getenv_float(key, default):
-    v = os.getenv(key)
-    if v is None or str(v).strip() == "":
-        return float(default)
-    try:
-        return float(v)
-    except Exception:
-        return float(default)
+def format_markdown_message(city_label, parsed, preview_days=5, emphasize_date=None):
+    # parsed: output of parse_yike_response
+    current = parsed.get("current")
+    forecast = parsed.get("forecast", [])
+    lines = []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    title = f"{city_label} 天气预报 - {now}"
+    lines.append(f"### {title}")
+    lines.append("")
 
-# --- main flow ---
+    # determine emphasize (today or tomorrow)
+    if emphasize_date:
+        target = emphasize_date
+    else:
+        target = current.get("date") if current and current.get("date") else (forecast[0].get("date") if forecast else None)
+
+    # find index in forecast list
+    idx = None
+    for i, d in enumerate(forecast):
+        if d.get("date") == target:
+            idx = i
+            break
+    if idx is None:
+        idx = 0
+
+    # main day detail
+    main = forecast[idx] if idx < len(forecast) else current
+    lines.append(f"**{target} 预报**")
+    lines.append(f"- 天气：{main.get('wea') or '无'}")
+    temp_display = main.get("tem") or (f\"{main.get('tem2') or ''} ~ {main.get('tem1') or ''}\".strip())
+    if temp_display:
+        lines.append(f"- 温度：{temp_display}")
+    if main.get("win"):
+        lines.append(f"- 风向/风力：{main.get('win')} {main.get('win_speed') or ''}")
+    # detect severe from wea/alarm
+    sev = []
+    if main.get("alarm"):
+        if isinstance(main.get("alarm"), (list, dict)):
+            sev.append(f"气象���警: {main.get('alarm')}")
+        else:
+            sev.append(str(main.get("alarm")))
+    sev += detect_severe_from_text(str(main.get("wea") or ""))
+    if sev:
+        for a in sev:
+            lines.append(f"> 🛑 **预警**：{a}")
+    lines.append("")
+
+    # preview
+    lines.append(f"**未来 {preview_days} 天预览**")
+    for j in range(idx, min(idx + preview_days, len(forecast))):
+        d = forecast[j]
+        date = d.get("date") or f"day{j}"
+        wea = d.get("wea") or ""
+        t1 = d.get("tem1") or ""
+        t2 = d.get("tem2") or ""
+        tem = d.get("tem") or ""
+        temps = tem if tem else (f\"{t2}~{t1}\".strip("~"))
+        lines.append(f"- {date}：{wea}，{temps}，风：{d.get('win') or ''} {d.get('win_speed') or ''}")
+    lines.append("")
+    lines.append("_数据来源：yiketianqi.com（你提供的 API）_")
+    return "\\n".join(lines), title
+
+# ---------- main ----------
 def main():
-    corpid = os.getenv("WECOM_CORP_ID")
-    corpsecret = os.getenv("WECOM_CORP_SECRET")
-    agentid = os.getenv("WECOM_AGENT_ID")
-    touser = os.getenv("WECOM_TO_USER", "@all")
-    city = os.getenv("CITY", "Xuancheng, China")
+    # load config
+    corpid = safe_getenv("WECOM_CORP_ID")
+    corpsecret = safe_getenv("WECOM_CORP_SECRET")
+    agentid = safe_getenv("WECOM_AGENT_ID")
+    touser = safe_getenv("WECOM_TO_USER", "@all")
+    city = safe_getenv("CITY", "Xuancheng, China")
 
     preview_days = getenv_int("PREVIEW_DAYS", 5)
-    # ensure preview_days is in a reasonable range
     if preview_days < 1:
         preview_days = 1
     if preview_days > 7:
         preview_days = 7
 
-    forecast_days = getenv_int("FORECAST_DAYS", max(preview_days, 5))
-    if forecast_days < preview_days:
-        forecast_days = preview_days
-
-    severe_rain = getenv_float("SEVERE_RAIN_MM", 20.0)
-    severe_wind = getenv_float("SEVERE_WIND_MS", 15.0)
-    mode = os.getenv("MODE", "auto")
+    # yiketianqi creds
+    yike_appid = safe_getenv("YIKE_APPID")
+    yike_appsecret = safe_getenv("YIKE_APPSECRET")
 
     if not (corpid and corpsecret and agentid):
         print("缺少企业微信配置: WECOM_CORP_ID / WECOM_CORP_SECRET / WECOM_AGENT_ID 必填", file=sys.stderr)
         sys.exit(1)
 
+    # fetch weather from yiketianqi
     try:
-        place = geocode_city(city)
+        raw = fetch_yike_weather(city, appid=yike_appid, appsecret=yike_appsecret)
     except Exception as e:
-        print("地理编码失败:", e, file=sys.stderr)
+        print("调用 yiketianqi 接口失败:", e, file=sys.stderr)
         sys.exit(2)
-    city_label = f"{place['name']}, {place.get('country','')}"
-    lat = place["latitude"]
-    lon = place["longitude"]
-    timezone = place.get("timezone", "auto")
 
+    # parse
     try:
-        data = fetch_forecast(lat, lon, timezone=timezone, days=forecast_days)
+        parsed = parse_yike_response(raw)
     except Exception as e:
-        print("获取天气数据失败:", e, file=sys.stderr)
+        print("解析 yiketianqi 返回数据失败:", e, file=sys.stderr)
+        # 为了调试，把原始返回的一部分打印出来（注意不要泄露 secret）
+        try:
+            import json
+            print(json.dumps(raw, ensure_ascii=False)[:1000], file=sys.stderr)
+        except Exception:
+            pass
         sys.exit(3)
 
+    city_label = parsed.get("city") or city
+
+    # decide emphasize date based on mode (morning->today, evening->tomorrow)
+    mode = safe_getenv("MODE", "auto")
     now = datetime.now()
     if mode == "auto":
         h = now.hour
-        if 4 <= h <= 12:
-            mode_res = "morning"
-        else:
-            mode_res = "evening"
+        mode_res = "morning" if 4 <= h <= 12 else "evening"
     else:
         mode_res = mode
-
     if mode_res == "morning":
-        target = now.strftime("%Y-%m-%d")
+        emphasize_date = now.strftime("%Y-%m-%d")
     else:
-        target = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        emphasize_date = (now + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    alerts = analyze_severe(data, severe_rain_mm=severe_rain, severe_wind_ms=severe_wind)
-    md_content, title = format_markdown(city_label, data, preview_days=preview_days, target_date=target, severe_alerts=alerts)
+    # format
+    md, title = format_markdown_message(city_label, parsed, preview_days=preview_days, emphasize_date=emphasize_date)
 
+    # send via wecom
     try:
         token = wecom_get_access_token(corpid, corpsecret)
-        resp = wecom_send_markdown(token, agentid, touser, title, md_content)
+        resp = wecom_send_markdown(token, agentid, touser, title, md)
     except Exception as e:
         print("发送企业微信消息失败:", e, file=sys.stderr)
         sys.exit(4)
