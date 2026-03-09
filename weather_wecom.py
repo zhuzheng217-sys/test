@@ -71,12 +71,12 @@ def fetch_forecast(lat, lon, timezone="auto", days=5):
 
 WEATHER_CODE_MAP = {
     0: "晴", 1: "主要晴/少云", 2: "多云", 3: "阴",
-    45: "雾/薄雾", 48: "冰霜雾",
+    45: "雾/薄雾", 48: "冰���雾",
     51: "毛毛雨/细雨", 53: "中等毛毛雨", 55: "浓毛毛雨",
     56: "冻毛毛雨", 57: "强冻毛毛雨",
     61: "小雨", 63: "中雨", 65: "大雨", 66: "冻小雨", 67: "冻大雨",
     71: "小雪", 73: "中雪", 75: "大雪", 77: "降雪颗粒",
-    80: "阵雨", 81: "强阵雨", 82: "暴雨性阵雨",
+    80: "阵��", 81: "强阵雨", 82: "暴雨性阵雨",
     85: "小雨夹雪", 86: "大雨夹雪",
     95: "雷暴", 96: "伴有小冰雹的雷暴", 99: "伴有大冰雹的雷暴",
 }
@@ -156,6 +156,7 @@ def format_markdown(city_label, forecast_json, preview_days=5, target_date=None,
     lines.append("_数据来源：Open-Meteo（免费）_")
     return "\n".join(lines), title
 
+# --- 企业微信交互 ---
 def wecom_get_access_token(corpid, corpsecret):
     params = {"corpid": corpid, "corpsecret": corpsecret}
     r = requests.get(WECOM_TOKEN_URL, params=params, timeout=10)
@@ -185,20 +186,52 @@ def wecom_send_markdown(access_token, agentid, touser, title, markdown):
         raise RuntimeError(f"企业微信发送失败: {data}")
     return data
 
+# --- safe env parsing helpers ---
+def getenv_int(key, default):
+    v = os.getenv(key)
+    if v is None or str(v).strip() == "":
+        return int(default)
+    try:
+        return int(v)
+    except Exception:
+        return int(default)
+
+def getenv_float(key, default):
+    v = os.getenv(key)
+    if v is None or str(v).strip() == "":
+        return float(default)
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
+
+# --- main flow ---
 def main():
     corpid = os.getenv("WECOM_CORP_ID")
     corpsecret = os.getenv("WECOM_CORP_SECRET")
     agentid = os.getenv("WECOM_AGENT_ID")
     touser = os.getenv("WECOM_TO_USER", "@all")
     city = os.getenv("CITY", "Xuancheng, China")
-    preview_days = int(os.getenv("PREVIEW_DAYS", "5"))
-    forecast_days = int(os.getenv("FORECAST_DAYS", str(max(preview_days, 5))))
-    severe_rain = float(os.getenv("SEVERE_RAIN_MM", "20.0"))
-    severe_wind = float(os.getenv("SEVERE_WIND_MS", "15.0"))
+
+    preview_days = getenv_int("PREVIEW_DAYS", 5)
+    # ensure preview_days is in a reasonable range
+    if preview_days < 1:
+        preview_days = 1
+    if preview_days > 7:
+        preview_days = 7
+
+    forecast_days = getenv_int("FORECAST_DAYS", max(preview_days, 5))
+    if forecast_days < preview_days:
+        forecast_days = preview_days
+
+    severe_rain = getenv_float("SEVERE_RAIN_MM", 20.0)
+    severe_wind = getenv_float("SEVERE_WIND_MS", 15.0)
     mode = os.getenv("MODE", "auto")
+
     if not (corpid and corpsecret and agentid):
         print("缺少企业微信配置: WECOM_CORP_ID / WECOM_CORP_SECRET / WECOM_AGENT_ID 必填", file=sys.stderr)
         sys.exit(1)
+
     try:
         place = geocode_city(city)
     except Exception as e:
@@ -208,11 +241,13 @@ def main():
     lat = place["latitude"]
     lon = place["longitude"]
     timezone = place.get("timezone", "auto")
+
     try:
         data = fetch_forecast(lat, lon, timezone=timezone, days=forecast_days)
     except Exception as e:
         print("获取天气数据失败:", e, file=sys.stderr)
         sys.exit(3)
+
     now = datetime.now()
     if mode == "auto":
         h = now.hour
@@ -222,18 +257,22 @@ def main():
             mode_res = "evening"
     else:
         mode_res = mode
+
     if mode_res == "morning":
         target = now.strftime("%Y-%m-%d")
     else:
         target = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+
     alerts = analyze_severe(data, severe_rain_mm=severe_rain, severe_wind_ms=severe_wind)
     md_content, title = format_markdown(city_label, data, preview_days=preview_days, target_date=target, severe_alerts=alerts)
+
     try:
         token = wecom_get_access_token(corpid, corpsecret)
         resp = wecom_send_markdown(token, agentid, touser, title, md_content)
     except Exception as e:
         print("发送企业微信消息失败:", e, file=sys.stderr)
         sys.exit(4)
+
     print("已成功发送：", resp)
 
 if __name__ == "__main__":
